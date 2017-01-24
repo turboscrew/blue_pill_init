@@ -20,7 +20,7 @@
 //#define DEBUG_RTC_INIT
 #define APPLICATION
 
-// doesn't work without xtal (yet)
+/* use xtal or internal clock for RTC */
 #define RTC_USE_XTAL
 
 //#define USART1_BAUD_115200
@@ -77,6 +77,7 @@
 #define RCC_APB2ENR 6
 #define RCC_APB1ENR 7
 #define RCC_BDCR 8
+#define RCC_CSR 9
 #define GPIO_CRL 0
 #define GPIO_CRH 1
 #define GPIO_IDR 2
@@ -370,24 +371,29 @@ void inir_rtc(void)
 	while (!(rtc[RTC_CRL] & (uint32_t) 0x00000008));
 #else
 	/* Set LSE OFF */
-    rcc[RCC_BDCR] = (rcc[RCC_BDCR] & (uint32_t) 0xfffe7ff8);
+    rcc[RCC_BDCR] = (rcc[RCC_BDCR] & (uint32_t) 0xfffe7cf8);
 
-    /* Wait until RTC external clock is stabilized -> LSERDY = 1 */
-    /*
+    /* Set LSI ON */
+    rcc[RCC_CSR] |= 0x00000001; /* LSION */
+    /* Wait until RTC internal clock is stabilized -> LSIRDY = 1 */
+
     tmp = 5000000;
-    while ((rcc[RCC_BDCR] & (uint32_t) 0x00000002) != (uint32_t) 0x00000002)
+    while ((rcc[RCC_CSR] & (uint32_t) 0x00000002) != (uint32_t) 0x00000002)
     {
     	tmp--;
     	if (!tmp)
     		while(1);
     }
-	*/
+
     /* RTC clock source selection + RTC clock enable */
     rcc[RCC_BDCR] = (rcc[RCC_BDCR] & (uint32_t) 0xfffe7cf8)
-		| ((uint32_t) 0x00008201);
+		| ((uint32_t) 0x00008200);
+	/* wait for synchronization (RSF) (can last a minute) */
+    rtc[RTC_CRL] &= (uint32_t) 0xfffffff7; /* mark not synced */
+	while (!(rtc[RTC_CRL] & (uint32_t) 0x00000008));
 #endif
-    tmp = (rtc[RTC_CRL] & 0x000000ff);
-	/* wait for last write to finish */
+
+	/* wait for last write to finish (RTOFF) */
 	while (!(rtc[RTC_CRL] & (uint32_t) 0x00000020));
 
 	rtc[RTC_CRL] = 0x00000010; /* enter CNF */
@@ -402,9 +408,9 @@ void inir_rtc(void)
     rtc[RTC_PRLL] = 0x00009C3F; /* Prescaler lo = 40 000 -> 1 Hz*/
 #endif
     rtc[RTC_CRL] = 0x00000000; /* exit CNF */
-	/* wait for last write to finish */
+	/* wait for last write to finish (RTOFF) */
 	while (!(rtc[RTC_CRL] & (uint32_t) 0x00000020));
-	/* wait for synchronization (can last a minute) */
+	/* wait for synchronization (RSF) (can last a minute) */
     rtc[RTC_CRL] &= (uint32_t) 0xfffffff7; /* mark not synced */
 	while (!(rtc[RTC_CRL] & (uint32_t) 0x00000008));
 	/* Mark RTC initialized */
