@@ -19,6 +19,9 @@
 //#define DEBUG_RTC_CLK
 //#define DEBUG_RTC_INIT
 #define APPLICATION
+#define STANDBY_ENABLED
+#define RTC_WAKEUP
+//#define WKUP_WAKEUP
 
 /* use xtal or internal clock for RTC */
 #define RTC_USE_XTAL
@@ -64,9 +67,10 @@
 #define FLASH_R_BASE          (AHBPERIPH_BASE + 0x2000)
 #define CRC_BASE              (AHBPERIPH_BASE + 0x3000)
 
-#define SCB_BASE              (PRIVPERIPH_BASE + 0xe008)
+#define SCB_BASE              (PRIVPERIPH_BASE + 0xed00)
 #define SYSTIC_BASE           (PRIVPERIPH_BASE + 0xe010)
 #define NVIC_BASE             (PRIVPERIPH_BASE + 0xe100)
+
 /* Registers */
 #define RCC_CR 0
 #define RCC_CFGR 1
@@ -88,6 +92,7 @@
 #define PC_13
 #define FLASH_ACR 0
 #define PWR_CR 0
+#define PWR_CSR 1
 #define RTC_CRH 0
 #define RTC_CRL 1
 #define RTC_PRLH 2
@@ -96,7 +101,9 @@
 #define RTC_DIVL 5
 #define RTC_CNTH 6
 #define RTC_CNTL 7
-#define BKP_DATA1 1
+#define RTC_ALRH 8
+#define RTC_ALRL 9
+#define BKP_DATA1 1 /* 1 - 42 */
 #define USART_SR 0
 #define USART_DR 1
 #define USART_BRR 2
@@ -123,6 +130,26 @@
 #define NVIC_ISER_0 0
 #define NVIC_ISER_1 1
 #define NVIC_ISER_2 2
+#define NVIC_ICER_0 32
+#define NVIC_ICER_1 33
+#define NVIC_ICER_2 34
+#define NVIC_ISPR_0 64
+#define NVIC_ISPR_1 65
+#define NVIC_ISPR_2 66
+#define NVIC_ICPR_0 96
+#define NVIC_ICPR_1 97
+#define NVIC_ICPR_2 98
+#define NVIC_IABR_0 128
+#define NVIC_IABR_1 129
+#define NVIC_IABR_2 130
+#define NVIC_IPR_0 192
+#define NVIC_STIR 896
+#define SCB_CPUID 0
+#define SCB_ICSR 1
+#define SCB_VTOR 2
+#define SCB_AIRCR 3
+#define SCB_SCR 4
+#define SCB_CCR 5
 
 /* When 72 MHz clock */
 #define TICS_PER_MS 0x1193F
@@ -130,6 +157,7 @@
 #define USART1_RXLEN 64
 #define USART1_TXLEN 64
 
+volatile uint32_t wup_flags;
 volatile uint32_t bkp_data;
 volatile uint32_t ticks;
 volatile uint32_t rx_head, rx_tail;
@@ -141,8 +169,6 @@ volatile uint32_t tx_dropped;
 volatile uint32_t ore;
 volatile uint32_t ne;
 volatile uint32_t fe;
-volatile uint32_t pe;
-volatile uint32_t false_irq;
 
 volatile uint8_t rtc_sec;
 volatile uint8_t rtc_min;
@@ -326,15 +352,63 @@ pedro:
 void inir_rtc(void)
 {
 	int tmp;
-	volatile uint32_t *rcc, *pwr, *bkp, *rtc;
+	volatile uint32_t *rcc, *pwr, *bkp, *rtc, *scb, *nvic;
 	rcc = (uint32_t *) RCC_BASE;
 	pwr = (uint32_t *) PWR_BASE;
 	bkp = (uint32_t *) BKP_BASE;
 	rtc = (uint32_t *) RTC_BASE;
+	scb = (uint32_t *) SCB_BASE;
+	nvic = (uint32_t *) NVIC_BASE;
+
+	/* if bkp domain is not reset */
+	bkp_data = bkp[BKP_DATA1] & 0x0000ffff;
+	if ((bkp[BKP_DATA1] & 0x0000ffff) == 0x0000a5a5)
+	{
+#ifdef STANDBY_ENABLED
+		wup_flags = pwr[PWR_CSR]; // store globally
+		if (wup_flags & 0x00000003) // wakeup?
+		{
+			rtc[RTC_CRH] &= ~0x00000002; // disable alarm interrupt
+			nvic[NVIC_ICER_1] |= (1 << 9); // disable interrupt from NVIC
+			nvic[NVIC_ICPR_1] |= (1 << 9); // clear pending from NVIC
+
+			/* clear wake up flags: SBF and WUP */
+			pwr[PWR_CR] &= ~0x0000000c;
+
+			/* SCB_SCR should be zero after reset */
+			/* no need to clear it */
+			// scb[SCB_SCR] = 0x00000000;
+
+			/* SEVONPEND = 0, SLEEPONEXIT = 0, DEEPSLEEP = 0 */
+			scb[SCB_SCR] &= 0x00000000;
+
+			// TODO: just a place
+			/* clear OWF, ALRF, SECF */
+			rtc[RTC_CRL] &= 0xfffffff8;
+
+			/* wait for synchronization (RSF)*/
+			rtc[RTC_CRL] &=  ~0x00000008; /* mark not synced */
+			while (!(rtc[RTC_CRL] & 0x00000008)); /* wait for sync */
+
+#if 0
+			/* if some actions are needed depending on
+			   whether waken up by RTC alarm or WKUP-pin */
+			if (wup_flags & 0x00000002) // SBF
+			{
+				pwr[PWR_CR] &= ~0x00000008; // CSBF
+			}
+
+			if (wup_flags & 0x00000001) // WKUP
+			{
+				pwr[PWR_CR] &= ~0x00000004; // CWUP
+			}
+#endif
+		}
+#endif
+		return;
+	}
 
     /* ***** Only after bkp domain reset(?) ***** */
-	bkp_data = bkp[BKP_DATA1] & 0x0000ffff;
-	if ((bkp[BKP_DATA1] & 0x0000ffff) == 0x0000a5a5) return;
 
     /* Write '1' to BDRST-bit in RCC_BDCR to reset Backup domain */
     rcc[RCC_BDCR] |= ((uint32_t) 0x00010000);
@@ -434,6 +508,80 @@ void rtc_get_time(void)
 	rtc_hour = rtc_time % 24;
 	rtc_day = rtc_time / 24;
 }
+
+#ifdef STANDBY_ENABLED
+void go_standby(void)
+{
+	volatile uint32_t *rcc, *pwr, *bkp, *rtc, *scb, *syst, *nvic;
+	// rcc = (uint32_t *) RCC_BASE;
+	pwr = (uint32_t *) PWR_BASE;
+	bkp = (uint32_t *) BKP_BASE;
+	rtc = (uint32_t *) RTC_BASE;
+	scb = (uint32_t *) SCB_BASE;
+	syst = (uint32_t *) SYSTIC_BASE;
+	nvic = (uint32_t *) NVIC_BASE;
+
+	/* TODO: save data over standy */
+	// bkp[BKP_DATA2] = ... // store data
+
+	/* stop systick interrupts */
+	syst[SYST_CSR] &= ~0x00000002;
+
+	/* clear RSF, OWF, ALRF, SECF */
+	rtc[RTC_CRL] &= 0xfffffff0;
+	/* wait until RTC second event flag */
+	while (rtc[RTC_CRL] & 0x00000001);
+	/* clear RSF, OWF, ALRF, SECF */
+	rtc[RTC_CRL] &= 0xfffffff0;
+
+#ifdef RTC_WAKEUP
+	/* wait for last write to finish (RTOFF) */
+	while (!(rtc[RTC_CRL] & (uint32_t) 0x00000020));
+	rtc[RTC_CRL] = 0x00000010; /* enter CNF */
+	/* sleeptime */
+	rtc[RTC_ALRH] = rtc[RTC_CNTH]; // high 16 bits
+	rtc[RTC_ALRL] = rtc[RTC_CNTL] + 0x0000001e; // 30 sec, low 16 bits
+	rtc[RTC_CRL] = 0x00000000; /* exit CNF */
+
+	/* wait for synchronization (RSF) (can last a minute) */
+    rtc[RTC_CRL] &= (uint32_t) 0xfffffff7; /* mark not synced */
+	while (!(rtc[RTC_CRL] & (uint32_t) 0x00000008));
+
+	/* wait for last write to finish (RTOFF) */
+	while (!(rtc[RTC_CRL] & (uint32_t) 0x00000020));
+
+	//rtc[RTC_CRH] |= 0x00000002; // enable alarm interrupt - must NOT do
+#endif
+
+#ifdef WKUP_WAKEUP
+	/* enable wakeup by WKUP-pin */
+	pwr[PWR_CSR] |= 0x00000100; // enable WKUP-pin
+#endif
+
+	/* clear all pending interrupts */
+	nvic[NVIC_ICPR_0] = 0xffffffff;
+	nvic[NVIC_ICPR_1] = 0xffffffff;
+	nvic[NVIC_ICPR_2] = 0xffffffff;
+
+	/* SEVONPEND = 0, SLEEPONEXIT = 0, DEEPSLEEP = 1 */
+	scb[SCB_SCR] = 0x00000004;
+	/* clear CSBF and CWUF, PDDS = standby */
+	pwr[PWR_CR] = (pwr[PWR_CR] & 0xfffffff0) | 0x0000000e;
+
+#if 1
+	// dsb is probably needed before wfi
+	asm volatile (
+		"dsb\n\t"
+		"wfi\n\t"
+	);
+#else
+	// check that timer alarm works before trying actual sleep
+	while (!(rtc[RTC_CRL] & 0x00000002)); // wait for RTC alarm
+	/* start systick interrupts */
+	syst[SYST_CSR] |= 0x00000002;
+#endif
+}
+#endif
 
 void init_usart1(void)
 {
@@ -882,21 +1030,37 @@ void main(void)
 			switch (ch)
 			{
 			case 'c': /* get time */
-				rtc_time = (rtc[RTC_CNTH] << 16) & 0xffff0000;
-				rtc_time |= (rtc[RTC_CNTL] & 0x0000ffff);
-				rtc_get_time();
-				pr_text("\r\nRTC: ");
-				pr_word(rtc_time);
-				pr_text("\r\n");
-				pr_dec((uint32_t) rtc_day);
-				pr_text(" days, ");
-				pr_dec((uint32_t) rtc_hour);
-				pr_text(":");
-				pr_dec((uint32_t) rtc_min);
-				pr_text(":");
-				pr_dec((uint32_t) rtc_sec);
-				pr_text("\r\n");
-			}
+				{
+					rtc_time = (rtc[RTC_CNTH] << 16) & 0xffff0000;
+					rtc_time |= (rtc[RTC_CNTL] & 0x0000ffff);
+					rtc_get_time();
+					pr_text("\r\nRTC: ");
+					pr_word(rtc_time);
+					pr_text("\r\n");
+					pr_dec((uint32_t) rtc_day);
+					pr_text(" days, ");
+					pr_dec((uint32_t) rtc_hour);
+					pr_text(":");
+					pr_dec((uint32_t) rtc_min);
+					pr_text(":");
+					pr_dec((uint32_t) rtc_sec);
+					pr_text("\r\n");
+					break;
+				}
+
+#ifdef STANDBY_ENABLED
+			case 's':
+				{
+					go_standby();
+					break;
+				}
+#endif
+
+			default:
+				{
+					break; // some compilers want this
+				}
+			} /* end switch */
 		}
 #endif
 
