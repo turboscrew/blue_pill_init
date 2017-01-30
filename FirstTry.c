@@ -22,6 +22,9 @@
 #define STANDBY_ENABLED
 #define RTC_WAKEUP
 //#define WKUP_WAKEUP
+#define VOLTAGE_ALARM
+//#define ADC_USED
+#define TEMP_SENSOR
 
 /* use xtal or internal clock for RTC */
 #define RTC_USE_XTAL
@@ -32,6 +35,9 @@
 
 // use TXE as transmit interrupt instead of TC
 #define DEBUG_UART1_TXE
+
+// Voltage alarm threshold 2,5V
+#define LOW_VOLTAGE_THR (3 << 5)
 
 // 32767 -> 1 Hz
 //#define RTC_PRESCALER_XTAL 0x00007fff
@@ -57,6 +63,7 @@
 #define AFIO_BASE             (APB2PERIPH_BASE + 0x0000)
 #define EXTI_BASE             (APB2PERIPH_BASE + 0x0400)
 #define PA_BASE               (APB2PERIPH_BASE + 0x0800)
+#define PB_BASE               (APB2PERIPH_BASE + 0x0c00)
 #define PC_BASE               (APB2PERIPH_BASE + 0x1000)
 #define ADC1_BASE             (APB2PERIPH_BASE + 0x2400)
 #define ADC2_BASE             (APB2PERIPH_BASE + 0x2800)
@@ -104,6 +111,7 @@
 #define RTC_ALRH 8
 #define RTC_ALRL 9
 #define BKP_DATA1 1 /* 1 - 42 */
+#define BKP_DATA2 2 /* 1 - 42 */
 #define USART_SR 0
 #define USART_DR 1
 #define USART_BRR 2
@@ -120,6 +128,32 @@
 #define TIM1_CNT 9
 #define TIM1_PSC 10
 #define TIM1_ARR 11
+#define EXTI_IMR 0
+#define EXTI_EMR 1
+#define EXTI_RTSR 2
+#define EXTI_FTSR 3
+#define EXTI_SWIER 4
+#define EXTI_PR 5
+#define ADC_SR 0
+#define ADC_CR1 1
+#define ADC_CR2 2
+#define ADC_SMPR1 3
+#define ADC_SMPR2 4
+#define ADC_JOFR1 5
+#define ADC_JOFR2 6
+#define ADC_JOFR3 7
+#define ADC_JOFR4 8
+#define ADC_HTR 9
+#define ADC_LTR 10
+#define ADC_SQR1 11
+#define ADC_SQR2 12
+#define ADC_SQR3 13
+#define ADC_JSQR 14
+#define ADC_JDR1 15
+#define ADC_JDR2 16
+#define ADC_JDR3 17
+#define ADC_JDR4 18
+#define ADC_DR 19
 
 #define SYST_CSR 0
 #define SYST_RVR 1
@@ -160,6 +194,8 @@
 volatile uint32_t wup_flags;
 volatile uint32_t bkp_data;
 volatile uint32_t ticks;
+volatile uint8_t power_low;
+
 volatile uint32_t rx_head, rx_tail;
 volatile uint32_t tx_head, tx_tail;
 volatile uint8_t rx_buff[USART1_RXLEN];
@@ -174,6 +210,10 @@ volatile uint8_t rtc_sec;
 volatile uint8_t rtc_min;
 volatile uint8_t rtc_hour;
 volatile uint8_t rtc_day;
+
+volatile uint32_t adc_values[3];
+
+volatile uint32_t dbg1, dbg2, dbg3;
 
 /* Code */
 
@@ -489,6 +529,8 @@ void inir_rtc(void)
 	while (!(rtc[RTC_CRL] & (uint32_t) 0x00000008));
 	/* Mark RTC initialized */
 	bkp[BKP_DATA1] = (bkp[BKP_DATA1] & 0xffff0000) | 0x0000a5a5;
+	/* Mark no power low */
+	bkp[BKP_DATA2] = (bkp[BKP_DATA2] & 0xffff0000) | 0x00000000;
 }
 
 /* read RTC seconds and set the global variables */
@@ -819,8 +861,144 @@ void init_timer1(void)
 	tim1[TIM1_CR1] |= 0x00000001; /* CEN - counter enable */
 }
 
+void init_pwrmon(void)
+{
+	uint32_t tmp;
+	volatile uint32_t *exti, *nvic, *pwr;
+	exti = (uint32_t *) EXTI_BASE;
+	nvic = (uint32_t *) NVIC_BASE;
+	pwr = (uint32_t *) PWR_BASE;
+
+	/* set threshold (PLS) */
+	tmp = (pwr[PWR_CR] & 0xffffff0f) | LOW_VOLTAGE_THR;
+	tmp |= 0x00000010; // enable (PVDE)
+	pwr[PWR_CR] = tmp;
+	/* PVD rising edge causes interrupt */
+	exti[EXTI_RTSR] |= 0x00010000; // PVD output
+	/* enable EXTI 16 interrupt */
+	exti[EXTI_IMR] |= 0x00010000; // PVD output
+	/* IRQ 1 = EXTI 16 = PVD */
+	nvic[NVIC_ISER_0] |= 0x00000002; // enable IRQ 1
+}
+
+void pwr_irq(void)
+{
+	power_low = 1;
+}
+
+#ifdef ADC_USED
+#define USE_ADC
+#else
+#ifdef TEMP_SENSOR
+#define USE_ADC
+#endif
+#endif
+
+#ifdef USE_ADC
+/* PB1 = ADC1_IN9, PB0 = ADC1_IN8 */
+void init_adc(void)
+{
+	int wloops;
+	volatile uint32_t *adc1, *rcc, *gpiob;
+	adc1 = (uint32_t *) ADC1_BASE;
+	rcc = (uint32_t *) RCC_BASE;
+	gpiob = (uint32_t *) PB_BASE;
+
+	/* PB1 and PB0 for ADC */
+	/* Does port B have clock? */
+	if (!(rcc[RCC_APB2ENR] & 0x00000008)) /* if port B doesn't have clock */
+	{
+		rcc[RCC_APB2ENR] |= 0x00000008;
+	}
+	/* Pins 1 and 0 as analog inputs */
+    gpiob[GPIO_CRL] &= (uint32_t) 0xffffff00;
+	gpiob[GPIO_BSRR] = 0x00000003; /* set bits 0 and 1 - OFF */
+
+	/* DISCEN? */
+	// adc1[ADC_CR1] = (adc1[ADC_CR1] & 0xff300000) | 0x00000800;
+	adc1[ADC_CR1] = (adc1[ADC_CR1] & 0xff300000) | 0x00000000;
+	adc1[ADC_SR] &= 0xffffffe0; // clear flags including EOC
+	/* TEMP, SWSTART, ADON (wake up)*/
+	adc1[ADC_CR2] = (adc1[ADC_CR2] & 0xff0106f0) | 0x008e0001;
+	/* wait at least 2 ADC cycles (72MHz/12MHz = 6) */
+	wloops = 12;
+	while (wloops--);
+	/* IN16 = temp, IN9 and IN8 = external sensors */
+	/* conversion time ch16&17: 17.1us ADC clk = 12 MHz => 205.2 cycles */
+	adc1[ADC_SMPR1] = (adc1[ADC_SMPR1] & 0xff000000) | 0x00fc0000;
+	/* the external sensors - use max time for them too */
+	adc1[ADC_SMPR2] = (adc1[ADC_SMPR2] & 0xc0000000) | 0x3f000000;
+	/* calibrate */
+	adc1[ADC_CR2] = (adc1[ADC_CR2] & 0xfffffff1) | 0x008e000c;
+	while (adc1[ADC_CR2] & 0x00000004); // wait for calibration
+	adc1[ADC_SR] &= 0xffffffe0; // clear flags
+
+	/* Only one channel at a time */
+	adc1[ADC_SQR1] = (adc1[ADC_SQR1] & 0xff000000) | 0x00100000;
+	adc1[ADC_SQR2] = (adc1[ADC_SQR2] & 0xc0000000) | 0x00000000;
+
+	/* ADC in power down mode by resetting the ADON bit */
+	// adc1[ADC_CR2] |= ~0x00000001; // ADON - start
+}
+
+void read_adc(void)
+{
+	int temp;
+	volatile uint32_t *adc1;
+	adc1 = (uint32_t *) ADC1_BASE;
+
+#ifdef TEMP_SENSOR
+	/* select TEMP - ADC1_IN16 */
+	adc1[ADC_SQR3] = (adc1[ADC_SQR3] & 0xc0000000) | 0x0000010;
+	adc1[ADC_CR2] |= 0x00000001; // ADON - start conversion
+	// adc1[ADC_SR] &= ~0x00000002 // clear EOC
+	while (!(adc1[ADC_SR] & 0x00000002)); // wait for conversion
+	/* read data - clear dual mode part (also resets EOC) */
+	adc_values[0] = adc1[ADC_DR] & 0x00000fff; // 12-bit ADC
+	// Temperature (in °C) = {(V25 - VSENSE) / Avg_Slope} + 25
+	// V25 = 1430mV typ., Avg_Slope = 4.3 mV/C typ., Vref+ = VDD
+	// VDD = 3300mV = 0x0fff => VSENSE = sense*3300/0x0fff
+	// (Vintref was 1.16V, so guess that V25 is also min = 1340mV)
+	// temp = ((1430 - VSENSE) / 4.3) + 25
+	// calculate in 0.1mV units
+	dbg1 = adc_values[0];
+	temp = (adc_values[0] * 33000) / 0x0fff;
+	dbg2 = temp;
+	adc_values[0] = ((13400 - temp) / 43) + 25;
+#if 1
+	/* Vintref - for debug */
+	adc1[ADC_SQR3] = (adc1[ADC_SQR3] & 0xc0000000) | 0x0000011;
+	adc1[ADC_CR2] |= 0x00000001; // ADON - start conversion
+	// adc1[ADC_SR] &= ~0x00000002 // clear EOC
+	while (!(adc1[ADC_SR] & 0x00000002)); // wait for conversion
+	/* read data - clear dual mode part (also resets EOC) */
+	dbg3 = adc1[ADC_DR] & 0x00000fff; // 12-bit ADC
+	dbg3 = dbg3 * 3300 / 0xfff; // Vintref in mV
+#endif
+#endif
+
+#ifdef ADC_USED
+	/* select ADC1_IN9 */
+	adc1[ADC_SQR3] = (adc1[ADC_SQR3] & 0xc0000000) | 0x0000009;
+	adc1[ADC_CR2] |= 0x00000001;
+	// adc1[ADC_SR] &= ~0x00000002
+	while (!(adc1[ADC_SR] & 0x00000002));
+	adc_values[1] = adc1[ADC_DR] & 0x0000ffff;
+
+	/* select ADC1_IN8 */
+	adc1[ADC_SQR3] = (adc1[ADC_SQR3] & 0xc0000000) | 0x0000008;
+	adc1[ADC_CR2] |= 0x00000001;
+	// adc1[ADC_SR] &= ~0x00000002
+	while (!(adc1[ADC_SR] & 0x00000002));
+	adc_values[2] = adc1[ADC_DR] & 0x0000ffff;
+#endif
+}
+#endif
+
 void init(void)
 {
+	power_low = 0;
+
 	/* RCC system reset */
 	RCC_reset();
 
@@ -835,6 +1013,14 @@ void init(void)
     inir_rtc();
 
     init_usart1();
+
+#ifdef VOLTAGE_ALARM
+    init_pwrmon();
+#endif
+
+#ifdef USE_ADC
+    init_adc();
+#endif
 
     /* for debugging usart1 baud problem */
 #ifdef DEBUG_TIM1_CLK
@@ -903,12 +1089,13 @@ void main(void)
 	char chr;
 	int flag, i;
 	uint32_t last, rtc_time, rtc_old, chime, systicks, rounds;
-	volatile uint32_t *gpioc, *syst, *rtc, *tim1, *rcc;
+	volatile uint32_t *gpioc, *syst, *rtc, *tim1, *rcc, *bkp;
 	gpioc = (uint32_t *) PC_BASE;
 	syst = (uint32_t *) SYSTIC_BASE;
 	rtc = (uint32_t *) RTC_BASE;
 	tim1 = (uint32_t *) TIM1_BASE;
 	rcc = (uint32_t *) RCC_BASE;
+	bkp = (uint32_t *) BKP_BASE;
 
 	init();
 	init_led();
@@ -1011,6 +1198,15 @@ void main(void)
 
 	while (1)
 	{
+		if (power_low)
+		{
+			if ((bkp[BKP_DATA2] & 0x0000ffff) == 0)
+			{
+				bkp[BKP_DATA2] = 1;
+				pr_text("\r\nPOWER LOW!\r\n");
+			}
+			power_low = 0;
+		}
 #ifdef DEBUG_USART1_ECHO
 		/* USART echo */
 		ch = getch();
@@ -1072,6 +1268,33 @@ void main(void)
 			{
 				gpioc[GPIO_BSRR] = 0x00002000; /* set bit 13 - LED OFF */
 				flag = 0;
+				/* TODO: bookmark */
+#ifdef USE_ADC
+				read_adc();
+#endif
+
+#ifdef TEMP_SENSOR
+				pr_text("TEMP: ");
+				pr_dec(adc_values[0]);
+				pr_text("\r\n");
+#if 0
+				pr_text("dbg1, Vsense, Vintref: ");
+				pr_word(dbg1);
+				pr_text(", ");
+				pr_dec(dbg2);
+				pr_text(", ");
+				pr_dec(dbg3);
+				pr_text("\r\n");
+#endif
+#endif
+
+#ifdef ADC_USED
+				pr_text("PB1, PB0: ");
+				pr_word(adc_values[1]);
+				pr_text(", ");
+				pr_word(adc_values[2]);
+				pr_text("\r\n");
+#endif
 			}
 			else
 			{
