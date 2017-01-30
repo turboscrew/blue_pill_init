@@ -4,6 +4,7 @@
 .extern main
 .extern clkint
 .extern usart1_irq
+.extern pwr_irq
 .globl _start
 
 .sect .vectors
@@ -27,7 +28,7 @@
 .word systmr @ SysTick
 @ Peripherals
 .word gen_exc @ IRQ0  WWDG
-.word gen_exc @ IRQ1  PVD
+.word pwrint @ IRQ1  PVD
 .word gen_exc @ IRQ2  TAMPER
 .word gen_exc @ IRQ3  RTC
 .word gen_exc @ IRQ4  FLASH
@@ -76,6 +77,12 @@
 systmr:
 	push {lr}
 	bl clkint
+	pop {pc}
+
+.thumb_func
+pwrint:
+	push {lr}
+	bl pwr_irq
 	pop {pc}
 
 .thumb_func
