@@ -24,7 +24,7 @@
 //#define WKUP_WAKEUP
 #define VOLTAGE_ALARM
 //#define ADC_USED
-#define TEMP_SENSOR
+//#define TEMP_SENSOR
 
 /* use xtal or internal clock for RTC */
 #define RTC_USE_XTAL
@@ -154,6 +154,15 @@
 #define ADC_JDR3 17
 #define ADC_JDR4 18
 #define ADC_DR 19
+#define SPI_CR1 0
+#define SPI_CR2 1
+#define SPI_SR 2
+#define SPI_DR 3
+#define SPI_CRCPR 4
+#define SPI_RXCRCR 5
+#define SPI_TXCRCR 6
+#define SPI_I2SCFGR 7
+#define SPI_I2SPR 8
 
 #define SYST_CSR 0
 #define SYST_RVR 1
@@ -188,8 +197,8 @@
 /* When 72 MHz clock */
 #define TICS_PER_MS 0x1193F
 #define MS_PER_HOUR 3600000
-#define USART1_RXLEN 64
-#define USART1_TXLEN 64
+#define USART1_RXLEN 128
+#define USART1_TXLEN 128
 
 volatile uint32_t wup_flags;
 volatile uint32_t bkp_data;
@@ -213,7 +222,7 @@ volatile uint8_t rtc_day;
 
 volatile uint32_t adc_values[3];
 
-volatile uint32_t dbg1, dbg2, dbg3;
+volatile uint32_t dbg1, dbg2, dbg3, dbg4, dbg5, dbg6;
 
 /* Code */
 
@@ -919,6 +928,9 @@ void init_adc(void)
 	adc1[ADC_CR1] = (adc1[ADC_CR1] & 0xff300000) | 0x00000000;
 	adc1[ADC_SR] &= 0xffffffe0; // clear flags including EOC
 	/* TEMP, SWSTART, ADON (wake up)*/
+	/* ADON is a bit difficult, because writing 0 to it turns ADC off
+	   and writing 1 to it starts conversion - there is no "leave alone"-
+	   option... */
 	adc1[ADC_CR2] = (adc1[ADC_CR2] & 0xff0106f0) | 0x008e0001;
 	/* wait at least 2 ADC cycles (72MHz/12MHz = 6) */
 	wloops = 12;
@@ -958,7 +970,7 @@ void read_adc(void)
 	// Temperature (in °C) = {(V25 - VSENSE) / Avg_Slope} + 25
 	// V25 = 1430mV typ., Avg_Slope = 4.3 mV/C typ., Vref+ = VDD
 	// VDD = 3300mV = 0x0fff => VSENSE = sense*3300/0x0fff
-	// (Vintref was 1.16V, so guess that V25 is also min = 1340mV)
+	// (Vrefint was 1.16V, so guess that V25 is also min = 1340mV)
 	// temp = ((1430 - VSENSE) / 4.3) + 25
 	// calculate in 0.1mV units
 	dbg1 = adc_values[0];
@@ -966,14 +978,24 @@ void read_adc(void)
 	dbg2 = temp;
 	adc_values[0] = ((13400 - temp) / 43) + 25;
 #if 1
-	/* Vintref - for debug */
+	/* Vrefint - for debug */
 	adc1[ADC_SQR3] = (adc1[ADC_SQR3] & 0xc0000000) | 0x0000011;
 	adc1[ADC_CR2] |= 0x00000001; // ADON - start conversion
 	// adc1[ADC_SR] &= ~0x00000002 // clear EOC
 	while (!(adc1[ADC_SR] & 0x00000002)); // wait for conversion
 	/* read data - clear dual mode part (also resets EOC) */
 	dbg3 = adc1[ADC_DR] & 0x00000fff; // 12-bit ADC
-	dbg3 = dbg3 * 3300 / 0xfff; // Vintref in mV
+	dbg4 = dbg3;
+	dbg3 = dbg3 * 33000 / 0xfff; // Vintref in 0.1mV
+	// if Vrefint: 1.16V min., 1.20V typ., 1.24V max.
+	// if vrefint were 1.20...
+	// dbg4 * VDD / 0xfff = 1200 mV
+	// VDD = 1200 mV * 0xfff / dbg4
+	//dbg4 = 12000 * 0xfff / dbg4; // calculated VDD
+	dbg4 = 32500; // measured
+	dbg5 = dbg1 * dbg4 / 0xfff; // Vsense by VDD
+//	dbg6 = ((14300 - dbg5) / 43) + 25; // Temp
+	dbg6 = ((13400 - dbg5) / 43) + 25;
 #endif
 #endif
 
@@ -994,6 +1016,7 @@ void read_adc(void)
 #endif
 }
 #endif
+
 
 void init(void)
 {
@@ -1277,13 +1300,20 @@ void main(void)
 				pr_text("TEMP: ");
 				pr_dec(adc_values[0]);
 				pr_text("\r\n");
-#if 0
-				pr_text("dbg1, Vsense, Vintref: ");
+#if 1
+				pr_text("dbg1, Vs, Vref: ");
 				pr_word(dbg1);
 				pr_text(", ");
 				pr_dec(dbg2);
 				pr_text(", ");
 				pr_dec(dbg3);
+				pr_text("\r\n");
+				pr_text("VDD, Vs2, T2: ");
+				pr_dec(dbg4);
+				pr_text(", ");
+				pr_dec(dbg5);
+				pr_text(", ");
+				pr_dec(dbg6);
 				pr_text("\r\n");
 #endif
 #endif
