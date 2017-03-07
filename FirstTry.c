@@ -17,14 +17,20 @@
 //#define DEBUG_TIM1_CLK
 //#define DEBUG_USART1_ECHO
 //#define DEBUG_RTC_CLK
-//#define DEBUG_RTC_INIT
+// for debugging PA1 interrupts by polling
+//#define DEBUG_PA1
+#define DEBUG_RTC_INIT
 #define APPLICATION
 #define STANDBY_ENABLED
 #define RTC_WAKEUP
-//#define WKUP_WAKEUP
+#define WKUP_WAKEUP
 #define VOLTAGE_ALARM
+// ADC not tested - not even tried
 //#define ADC_USED
 //#define TEMP_SENSOR
+#define DHT_SENSOR
+// SPI not tested - not even tried
+#define SPI_USED
 
 /* use xtal or internal clock for RTC */
 #define RTC_USE_XTAL
@@ -32,6 +38,10 @@
 //#define USART1_BAUD_115200
 #define USART1_BAUD_19200
 //#define USART1_BAUD_9600
+
+// 72 MHz / 8 = 16MHz
+// RFM69: max 10 MHz
+#define SPI1_BAUD 2
 
 // use TXE as transmit interrupt instead of TC
 #define DEBUG_UART1_TXE
@@ -47,6 +57,15 @@
 /* FCK_CNT = fCK_PSC / (PSC[15:0] + 1).
    72 MHz / 0x1C1F = 10 000 Hz = 0.1 ms per tick */
 #define TIM1_PRESCALER 0x1C1F
+/* FCK_CNT = fCK_PSC / (PSC[15:0] + 1).
+   72 -> 1us per tick = 1 MHz */
+/* The timer clock frequencies are automatically fixed by hardware. There are two cases:
+1. if the APB prescaler is 1, the timer clock frequencies are set to the same frequency as
+that of the APB domain to which the timers are connected.
+2. otherwise, they are set to twice (×2) the frequency of the APB domain to which the
+timers are connected. RM0008, 7.2 Clocks */
+#define TIM2_PRESCALER 71
+
 
 #define PERIPH_BASE           0x40000000
 
@@ -57,6 +76,7 @@
 #define PRIVPERIPH_BASE       0xe0000000
 
 /* Peripherals */
+#define TIM2_BASE             (APB1PERIPH_BASE + 0x0000)
 #define RTC_BASE              (APB1PERIPH_BASE + 0x2800)
 #define BKP_BASE              (APB1PERIPH_BASE + 0x6C00)
 #define PWR_BASE              (APB1PERIPH_BASE + 0x7000)
@@ -96,6 +116,14 @@
 #define GPIO_BSRR 4
 #define GPIO_BRR 5
 #define GPIO_LCKR 6
+#define AFIO_EVCR 0
+#define AFIO_MAPR 1
+#define AFIO_EXTICR1 2
+#define AFIO_EXTICR2 3
+#define AFIO_EXTICR3 4
+#define AFIO_EXTICR4 5
+/* reg 6 doesn't exist */
+#define AFIO_MAPR2 7
 #define PC_13
 #define FLASH_ACR 0
 #define PWR_CR 0
@@ -119,15 +147,24 @@
 #define USART_CR2 4
 #define USART_CR3 5
 #define USART_GTPR 6
-#define TIM1_CR1 0
-#define TIM1_CR2 1
-#define TIM1_SMCR 2
-#define TIM1_DIER 3
-#define TIM1_SR 4
-#define TIM1_EGR 5
-#define TIM1_CNT 9
-#define TIM1_PSC 10
-#define TIM1_ARR 11
+#define TIM_CR1 0
+#define TIM_CR2 1
+#define TIM_SMCR 2
+#define TIM_DIER 3
+#define TIM_SR 4
+#define TIM_EGR 5
+#define TIM_CCMR1 6
+#define TIM_CCMR2 7
+#define TIM_CCER 8
+#define TIM_CNT 9
+#define TIM_PSC 10
+#define TIM_ARR 11
+#define TIM_CCR1 12
+#define TIM_CCR2 13
+#define TIM_CCR3 14
+#define TIM_CCR4 15
+#define TIM_DCR 16
+#define TIM_DMAR 17
 #define EXTI_IMR 0
 #define EXTI_EMR 1
 #define EXTI_RTSR 2
@@ -197,8 +234,16 @@
 /* When 72 MHz clock */
 #define TICS_PER_MS 0x1193F
 #define MS_PER_HOUR 3600000
+
 #define USART1_RXLEN 128
 #define USART1_TXLEN 128
+#define SPI1_BLEN 64
+
+// from loader script
+extern char __sys_stack;
+extern char __usr_stack;
+extern char __usr_stksz;
+extern char __sys_stksz;
 
 volatile uint32_t wup_flags;
 volatile uint32_t bkp_data;
@@ -215,6 +260,8 @@ volatile uint32_t ore;
 volatile uint32_t ne;
 volatile uint32_t fe;
 
+volatile uint8_t spi1_buff[SPI1_BLEN];
+
 volatile uint8_t rtc_sec;
 volatile uint8_t rtc_min;
 volatile uint8_t rtc_hour;
@@ -222,7 +269,22 @@ volatile uint8_t rtc_day;
 
 volatile uint32_t adc_values[3];
 
+volatile uint8_t dht_ready;
+volatile uint8_t dht_bits_left;
+volatile uint8_t dht_ack_wait;
+volatile uint32_t ts_rising;
+volatile uint8_t dht_buff[9];
+volatile uint32_t dht_dbg_ints;
+volatile uint32_t dht_dbg_any, dht_dbg_any2;
+
 volatile uint32_t dbg1, dbg2, dbg3, dbg4, dbg5, dbg6;
+
+#ifdef DEBUG_PA1
+volatile uint8_t dbg_pa1_flag;
+volatile uint32_t dbg_tms_buff[256];
+volatile uint32_t dbg_edge_buff[256];
+volatile uint32_t dbg_tm_idx;
+#endif
 
 /* Code */
 
@@ -240,6 +302,22 @@ void clkint(void)
 			ticks -= MS_PER_HOUR;
 		}
 	}
+}
+
+uint32_t time_diff(uint32_t now, uint32_t earlier)
+{
+	int tmp = now - earlier;
+	if (tmp < 0)
+	{
+		tmp = MS_PER_HOUR - (earlier - now); /* modulo hour */
+	}
+	return (uint32_t) tmp;
+}
+
+void wait_ms(uint32_t wtime)
+{
+	uint32_t last = ticks;
+	while (time_diff(ticks, last) < wtime);
 }
 
 void RCC_reset(void)
@@ -398,7 +476,7 @@ pedro:
 }
 
 /* ***** RTC ***** */
-void inir_rtc(void)
+void init_rtc(void)
 {
 	int tmp;
 	volatile uint32_t *rcc, *pwr, *bkp, *rtc, *scb, *nvic;
@@ -411,7 +489,8 @@ void inir_rtc(void)
 
 	/* if bkp domain is not reset */
 	bkp_data = bkp[BKP_DATA1] & 0x0000ffff;
-	if ((bkp[BKP_DATA1] & 0x0000ffff) == 0x0000a5a5)
+	if (((bkp[BKP_DATA1] & 0x0000ffff) == 0x0000a5a5)
+		|| ((bkp[BKP_DATA1] & 0x0000ffff) == 0x00005a5a))
 	{
 #ifdef STANDBY_ENABLED
 		wup_flags = pwr[PWR_CSR]; // store globally
@@ -462,19 +541,24 @@ void inir_rtc(void)
     /* Write '1' to BDRST-bit in RCC_BDCR to reset Backup domain */
     rcc[RCC_BDCR] |= ((uint32_t) 0x00010000);
 
+	/* Enable PWR, BKP and SPI2, disable other peripherals */
+	rcc[RCC_APB1ENR] = (rcc[RCC_APB1ENR] & (uint32_t) 0xc5013600)
+		| ((uint32_t) 0x18004000);
+
 	/* Enable Backup domain access after bkp-reset
 		for access to most RCC_BDCR-bits */
 	pwr[PWR_CR] =(pwr[PWR_CR] & (uint32_t) 0xfffffe00)
 		| ((uint32_t) 0x00000100); 	/* Set DBP-bit */
 
-	/* Enable PWR, BKP and SPI2, disable other peripherals */
-	rcc[RCC_APB1ENR] = (rcc[RCC_APB1ENR] & (uint32_t) 0xc5013600)
-		| ((uint32_t) 0x18004000);
-
 #ifdef RTC_USE_XTAL
-	/* Set LSE ON */
-    rcc[RCC_BDCR] = (rcc[RCC_BDCR] & (uint32_t) 0xfffe7ff8)
-		| ((uint32_t) 0x00000001);
+	/* Set LSE ON and remove BDRST*/
+    //rcc[RCC_BDCR] = (rcc[RCC_BDCR] & (uint32_t) 0xfffe7ff8)
+	//	| ((uint32_t) 0x00000001);
+
+    /* RTC clock source selection + RTC clock enable + LSE ON
+       remove BDRST */
+    rcc[RCC_BDCR] = (rcc[RCC_BDCR] & (uint32_t) 0xfffe7cf8)
+		| ((uint32_t) 0x00008101);
 
     /* Wait until RTC external clock is stabilized -> LSERDY = 1 */
     tmp = 5000000;
@@ -485,16 +569,12 @@ void inir_rtc(void)
     		while(1);
     }
 
-    /* RTC clock source selection + RTC clock enable */
-    rcc[RCC_BDCR] = (rcc[RCC_BDCR] & (uint32_t) 0xfffe7cf8)
-		| ((uint32_t) 0x00008101);
-
     /* wait for synchronization (RSF) */
     rtc[RTC_CRL] &= (uint32_t) 0xfffffff7; /* mark not synced */
 	while (!(rtc[RTC_CRL] & (uint32_t) 0x00000008));
 #else
 	/* Set LSE OFF */
-    rcc[RCC_BDCR] = (rcc[RCC_BDCR] & (uint32_t) 0xfffe7cf8);
+    //rcc[RCC_BDCR] = (rcc[RCC_BDCR] & (uint32_t) 0xfffe7cf8);
 
     /* Set LSI ON */
     rcc[RCC_CSR] |= 0x00000001; /* LSION */
@@ -508,10 +588,12 @@ void inir_rtc(void)
     		while(1);
     }
 
-    /* RTC clock source selection + RTC clock enable */
+    /* RTC clock source selection + RTC clock enable + LSE OFF
+       + remove BDRST */
     rcc[RCC_BDCR] = (rcc[RCC_BDCR] & (uint32_t) 0xfffe7cf8)
 		| ((uint32_t) 0x00008200);
-	/* wait for synchronization (RSF) (can last a minute) */
+
+    /* wait for synchronization (RSF) (can last a minute) */
     rtc[RTC_CRL] &= (uint32_t) 0xfffffff7; /* mark not synced */
 	while (!(rtc[RTC_CRL] & (uint32_t) 0x00000008));
 #endif
@@ -528,7 +610,8 @@ void inir_rtc(void)
 #else
     /* Internal RC - 40 kHz typical (30 - 60) */
     rtc[RTC_PRLH] = 0x00000000; /* Prescaler hi */
-    rtc[RTC_PRLL] = 0x00009C3F; /* Prescaler lo = 40 000 -> 1 Hz*/
+//    rtc[RTC_PRLL] = 0x00009C3F; /* Prescaler lo = 40 000 -> 1 Hz*/
+    rtc[RTC_PRLL] = 0x00004E1F; // for debugging
 #endif
     rtc[RTC_CRL] = 0x00000000; /* exit CNF */
 	/* wait for last write to finish (RTOFF) */
@@ -537,10 +620,140 @@ void inir_rtc(void)
     rtc[RTC_CRL] &= (uint32_t) 0xfffffff7; /* mark not synced */
 	while (!(rtc[RTC_CRL] & (uint32_t) 0x00000008));
 	/* Mark RTC initialized */
+#ifdef RTC_USE_XTAL
 	bkp[BKP_DATA1] = (bkp[BKP_DATA1] & 0xffff0000) | 0x0000a5a5;
+#else
+	bkp[BKP_DATA1] = (bkp[BKP_DATA1] & 0xffff0000) | 0x00005a5a;
+#endif
 	/* Mark no power low */
 	bkp[BKP_DATA2] = (bkp[BKP_DATA2] & 0xffff0000) | 0x00000000;
 }
+
+/* ******************** */
+/* RE-INIT RTC */
+void reinit_rtc(void)
+{
+	int tmp;
+	volatile uint32_t *rcc, *pwr, *bkp, *rtc, *scb, *nvic;
+	rcc = (uint32_t *) RCC_BASE;
+	pwr = (uint32_t *) PWR_BASE;
+	bkp = (uint32_t *) BKP_BASE;
+	rtc = (uint32_t *) RTC_BASE;
+	scb = (uint32_t *) SCB_BASE;
+	nvic = (uint32_t *) NVIC_BASE;
+
+	bkp_data = bkp[BKP_DATA1] & 0x0000ffff;
+
+   /* Write '1' to BDRST-bit in RCC_BDCR to reset Backup domain */
+	rcc[RCC_BDCR] |= ((uint32_t) 0x00010000);
+	//rcc[RCC_BDCR] &= ~((uint32_t) 0x00010000);
+
+	/* Enable BKP */
+	rcc[RCC_APB1ENR] |= 0x01000000;
+
+	/* Enable Backup domain access after bkp-reset
+		for access to most RCC_BDCR-bits */
+	pwr[PWR_CR] =(pwr[PWR_CR] & (uint32_t) 0xfffffe00)
+		| ((uint32_t) 0x00000100); 	/* Set DBP-bit */
+
+	if (bkp_data == 0x00005a5a) // LSI was ON
+	{
+		/* Set LSI OFF */
+		rcc[RCC_CSR] &= ~0x00000001; /* LSION */
+
+		/* Set LSE ON */
+		//rcc[RCC_BDCR] = (rcc[RCC_BDCR] & (uint32_t) 0xfffe7ff8)
+		//	| ((uint32_t) 0x00000001);
+
+		/* RTC clock source selection + RTC clock enable + LSE ON
+		   + remove BDRST */
+		rcc[RCC_BDCR] = (rcc[RCC_BDCR] & (uint32_t) 0xfffe7cf8)
+			| ((uint32_t) 0x00008101);
+
+		/* Wait until RTC external clock is stabilized -> LSERDY = 1 */
+		tmp = 50000000;
+		while ((rcc[RCC_BDCR] & (uint32_t) 0x00000002) != (uint32_t) 0x00000002)
+		{
+			tmp--;
+			if (!tmp)
+				while(1);
+		}
+
+		/* RTC clock source selection + RTC clock enable */
+		//rcc[RCC_BDCR] = (rcc[RCC_BDCR] & (uint32_t) 0xfffe7cf8)
+		//	| ((uint32_t) 0x00008101);
+
+		/* wait for synchronization (RSF) */
+		rtc[RTC_CRL] &= (uint32_t) 0xfffffff7; /* mark not synced */
+		while (!(rtc[RTC_CRL] & (uint32_t) 0x00000008));
+	}
+	else
+	{
+		/* Set LSE OFF */
+		//rcc[RCC_BDCR] = (rcc[RCC_BDCR] & (uint32_t) 0xfffe7cf8);
+
+		/* Set LSI ON */
+		rcc[RCC_CSR] |= 0x00000001; /* LSION */
+
+		/* Wait until RTC internal clock is stabilized -> LSIRDY = 1 */
+		tmp = 50000000;
+		while ((rcc[RCC_CSR] & (uint32_t) 0x00000002) != (uint32_t) 0x00000002)
+		{
+			tmp--;
+			if (!tmp)
+				while(1);
+		}
+
+		/* RTC clock source selection + RTC clock enable
+		   + remove BDRST */
+		rcc[RCC_BDCR] = (rcc[RCC_BDCR] & (uint32_t) 0xfffe7cf8)
+			| ((uint32_t) 0x00008200);
+		/* wait for synchronization (RSF) (can last a minute) */
+		rtc[RTC_CRL] &= (uint32_t) 0xfffffff7; /* mark not synced */
+		while (!(rtc[RTC_CRL] & (uint32_t) 0x00000008));
+	}
+
+	/* wait for last write to finish (RTOFF) */
+	while (!(rtc[RTC_CRL] & (uint32_t) 0x00000020));
+
+	rtc[RTC_CRL] = 0x00000010; /* enter CNF */
+    rtc[RTC_CNTH] = 0x00000000; /* Count high */
+    rtc[RTC_CNTL] = 0x00000000; /* Count low */
+	if (bkp_data == 0x00005a5a) // LSI was ON
+	{
+		rtc[RTC_PRLH] = 0x00000000; /* Prescaler hi */
+		rtc[RTC_PRLL] = RTC_PRESCALER_XTAL; /* Prescaler lo */
+	}
+	else
+	{
+		/* Internal RC - 40 kHz typical (30 - 60) */
+		/* Make faster (double) to be distinct from xtal */
+		rtc[RTC_PRLH] = 0x00000000; /* Prescaler hi */
+		rtc[RTC_PRLL] = 0x00004E1F; /* Prescaler lo = 40 000 -> 1 Hz*/
+		//rtc[RTC_PRLL] = 0x00009C3F; /* Prescaler lo = 40 000 -> 1 Hz*/
+	}
+    rtc[RTC_CRL] = 0x00000000; /* exit CNF */
+	/* wait for last write to finish (RTOFF) */
+	while (!(rtc[RTC_CRL] & (uint32_t) 0x00000020));
+	/* wait for synchronization (RSF) (can last a minute) */
+    rtc[RTC_CRL] &= (uint32_t) 0xfffffff7; /* mark not synced */
+	while (!(rtc[RTC_CRL] & (uint32_t) 0x00000008));
+	/* Mark RTC initialized */
+	if (bkp_data == 0x00005a5a) // LSI was ON
+	{
+		/* now LSE is ON */
+		bkp[BKP_DATA1] = (bkp[BKP_DATA1] & 0xffff0000) | 0x0000a5a5;
+	}
+	else
+	{
+		/* now LSI is ON */
+		bkp[BKP_DATA1] = (bkp[BKP_DATA1] & 0xffff0000) | 0x00005a5a;
+	}
+	/* Mark no power low */
+	bkp[BKP_DATA2] = (bkp[BKP_DATA2] & 0xffff0000) | 0x00000000;
+}
+
+/* ******************** */
 
 /* read RTC seconds and set the global variables */
 void rtc_get_time(void)
@@ -572,7 +785,7 @@ void go_standby(void)
 	syst = (uint32_t *) SYSTIC_BASE;
 	nvic = (uint32_t *) NVIC_BASE;
 
-	/* TODO: save data over standy */
+	/* TODO: save data over standby */
 	// bkp[BKP_DATA2] = ... // store data
 
 	/* stop systick interrupts */
@@ -620,7 +833,7 @@ void go_standby(void)
 	pwr[PWR_CR] = (pwr[PWR_CR] & 0xfffffff0) | 0x0000000e;
 
 #if 1
-	// dsb is probably needed before wfi
+	// dsb is probably a good idea before wfi
 	asm volatile (
 		"dsb\n\t"
 		"wfi\n\t"
@@ -851,23 +1064,329 @@ void init_timer1(void)
 	   TIM1_PRESCALER = 0x1C1F */
 	/* Update_event = TIM_CLK/((PSC + 1)*(ARR + 1)*(RCR + 1)) */
 	/* Time base configuration */
-	tim1[TIM1_PSC] = TIM1_PRESCALER;
-	tim1[TIM1_ARR] = 0x2710; /* 10 000 = 1 s */
-	tim1[TIM1_CNT] = 0x2710; /* initialize */
+	tim1[TIM_PSC] = TIM1_PRESCALER;
+	tim1[TIM_ARR] = 0x2710; /* 10 000 = 1 s */
+	tim1[TIM_CNT] = 0x2710; /* initialize */
 
-	tim1[TIM1_CR1] = (tim1[TIM1_CR1] & 0xfffffc00)
+	tim1[TIM_CR1] = (tim1[TIM_CR1] & 0xfffffc00)
 		| 0x0080; // check ARPE, URS and UDIS; CEN is needed
-	tim1[TIM1_CR2] &= 0xffff8002; // check MMS
-	tim1[TIM1_SMCR]	&= 0xffff0008;
-	tim1[TIM1_DIER] &= 0xffff8000;
+	tim1[TIM_CR2] &= 0xffff8002; // check MMS
+	tim1[TIM_SMCR]	&= 0xffff0008;
+	tim1[TIM_DIER] &= 0xffff8000;
 #if 1
-	tim1[TIM1_EGR] = (tim1[TIM1_EGR] & 0xffffff00)
+	tim1[TIM_EGR] = (tim1[TIM_EGR] & 0xffffff00)
 		| 0x0001; // UG?
 #else
-	tim1[TIM1_EGR] &= 0xffffff00;
+	tim1[TIM_EGR] &= 0xffffff00;
 #endif
 
-	tim1[TIM1_CR1] |= 0x00000001; /* CEN - counter enable */
+	tim1[TIM_CR1] |= 0x00000001; /* CEN - counter enable */
+}
+
+#ifdef DHT_SENSOR
+// TODO: Change to use input capture instead of GPIO interrupts.
+//
+// NOW:
+// Timer 2 a free running 1 us 16-bit timer (for any use)
+// Output compare for timing the start pulse
+// - a GPIO with both rising and falling edge interrupts for data
+// - on edge interrupt the time stamp is read from the counter and
+//   the bit level is read to define if it's rising or falling edge
+
+void init_timer2(void)
+{
+	volatile uint32_t *tim2, *rcc, *exti, *nvic, *afio;
+	tim2 = (uint32_t *) TIM2_BASE;
+	rcc = (uint32_t *) RCC_BASE;
+	exti = (uint32_t *) EXTI_BASE;
+	nvic = (uint32_t *) NVIC_BASE;
+	afio = (uint32_t *) AFIO_BASE;
+
+	dht_ready = 0; // not read yet
+	dht_ack_wait = 0;
+	dht_dbg_ints = 0;
+	/* CH2, uses PA1, so let's use that just in case... */
+	/* Does port A have clock? */
+	if (!(rcc[RCC_APB2ENR] & 0x00000004)) /* if port A doesn't have clock */
+	{
+		rcc[RCC_APB2ENR] |= 0x00000004;
+	}
+	/* clock for timer2 */
+	rcc[RCC_APB1ENR] |= ((uint32_t) 0x00000001);
+
+	/* FCK_CNT = fCK_PSC / (PSC[15:0] + 1).
+	   TIM2_PRESCALER = 71 -> 1us tick */
+/* The timer clock frequencies are automatically fixed by hardware. There are two cases:
+1. if the APB prescaler is 1, the timer clock frequencies are set to the same frequency as
+that of the APB domain to which the timers are connected.
+2. otherwise, they are set to twice (×2) the frequency of the APB domain to which the
+timers are connected. RM0008, 7.2 Clocks */
+
+	/* Time base configuration */
+	tim2[TIM_PSC] = TIM2_PRESCALER;
+	tim2[TIM_ARR] = 0xffff; /* 'reload' is actually limit */
+	tim2[TIM_CNT] = 0x0000; /* initialize */
+
+	tim2[TIM_CR1] = (tim2[TIM_CR1] & 0xfffffc00)
+	//	| 0x0007; // URS, UDIS, CEN
+		| 0x0001; // CEN
+
+	/* compare match for 1 ms dht-reading start pulse */
+	tim2[TIM_DIER] &= 0xffffa0a0; // disable interrupts
+	tim2[TIM_CR2] &= 0xffffff07; // clear (check MMS)
+	tim2[TIM_SMCR] &= 0xffff0008; // clear slave mode
+	/* compare/capture mode */
+#if 0
+	tim2[TIM_CCMR1] &= 0xffff0000; // OC1M = 000
+#else
+	tim2[TIM_CCMR1] = (tim2[TIM_CCMR1] & 0xffff0000)
+		| 0x00000010; // OC1M = 001
+#endif
+	tim2[TIM_EGR] = (tim2[TIM_EGR] & 0xffffffa0)
+		| 1; // CC1G (enable compare match event), UG
+
+	/* configure PA1 interrupt for both edges */
+	nvic[NVIC_ICER_0] |= 0x00000080; // mask EXTI1 IRQ
+	nvic[NVIC_ICPR_0] |= 0x00000080; // clear EXTI1 pending
+	afio[AFIO_EXTICR1] = (afio[AFIO_EXTICR1] & 0xffffff0f)
+		| 0x00000000; // PA1 to EXTI1
+	exti[EXTI_IMR] &= ~2; // mask exti1 irq
+	exti[EXTI_EMR] &= ~2; // mask exti1 event
+	exti[EXTI_RTSR] |= 2; // exti1 rising edge irq
+	exti[EXTI_FTSR] |= 2; // exti1 falling edge irq
+	exti[EXTI_PR] |= 2; // clear pending event
+}
+
+void dht_request(void)
+{
+	/* CH2, uses PA1, so let's use that in case... */
+	uint32_t tmp1; // for debug
+	volatile uint32_t *tim2, *gpioa, *nvic;
+	tim2 = (uint32_t *) TIM2_BASE;
+	gpioa = (uint32_t *) PA_BASE;
+	nvic = (uint32_t *) NVIC_BASE;
+
+	// DHT being read
+	dht_ready = 0;
+
+	tim2[TIM_DIER] &= 0xffffa0a0; // disable interrupts
+
+#if 1
+	tim2[TIM_CCMR1] &= 0xffff0000; // OC1M = 000
+#else
+	tim2[TIM_CCMR1] = (tim2[TIM_CCMR1] & 0xffff0000)
+		| 0x00000010; // OC1M = 001
+#endif
+	tim2[TIM_EGR] = (tim2[TIM_EGR] & 0xffffffa0)
+		| 2; // CC1G (enable compare match event)
+
+	/* pin PA1 = request output to AM2301 */
+	gpioa[GPIO_BSRR] = 0x00000002; // PA1 high before enabling output
+#if 0
+	/* GPIO open-drain output, max 10 MHz */
+	gpioa[GPIO_CRL] = (gpioa[GPIO_CRL] & 0xffffff0f)
+			| 0x00000050;
+#else
+	gpioa[GPIO_CRL] = (gpioa[GPIO_CRL] & 0xffffff0f)
+			| 0x00000010; // push-pull 10MHz
+#endif
+	gpioa[GPIO_BSRR] = 0x00020000; // PA1 low
+	// match after 1 ms, even if counter overflows
+	// min 800us, typ 1ms, max 20 ms
+	// 1000 doesn't seem to be enough - most libraries seem to
+	// use closer to 20 ms pulses.
+#if 1
+	// for debugging
+	tmp1 = (tim2[TIM_CNT] + 18000) % 0x10000;
+	tim2[TIM_CCR1] = tmp1;
+
+#else
+	tim2[TIM_CCR1] = (tim2[TIM_CNT] + 18000) % 0x10000;
+#endif
+	tim2[TIM_SR] &= 0xffffe1a0; // clear flags
+	tim2[TIM_DIER] = (tim2[TIM_DIER] & 0xffffa0a0)
+		| 2; // CC1IE (enable compare 1 interrupt)
+	nvic[NVIC_ICPR_0] |= 0x10000000; // clear tim2 pending
+	nvic[NVIC_ISER_0] |= 0x10000000; // enable tim2 IRQ (28)
+}
+#endif
+
+void timer2_irq(void)
+{
+	/* CH2, uses PA1, so let's use that in case... */
+	volatile uint32_t *tim2, *gpioa, *nvic, *exti;
+	uint32_t tmp, tmp2, tmp3;
+	tim2 = (uint32_t *) TIM2_BASE;
+	gpioa = (uint32_t *) PA_BASE;
+	nvic = (uint32_t *) NVIC_BASE;
+	exti = (uint32_t *) EXTI_BASE;
+
+	// tmp = tim2[TIM_SR]; // for debug
+	nvic[NVIC_ICER_0] |= 0x10000000; // disable tim2 IRQ
+	nvic[NVIC_ICPR_0] |= 0x10000000; // clear tim2 pending
+	tim2[TIM_DIER] &= 0xffffa0a0; // disable compare interrupts
+	//gpioa[GPIO_BSRR] = 0x00000002; // PA1 high (idle)
+	/* Start receiving */
+#if 0
+	/* pin PA1 = tmr2_ch2 */
+	/* input floating - AM2301 requires 1kOhm pull-up => 5 mA */
+	/* STM32F103 can source/sink 25mA, and it's pull-up is ~40kOhm */
+	gpioa[GPIO_CRL] = (gpioa[GPIO_CRL] & 0xffffff0f)
+			| 0x00000040;
+#else
+	/* pin PA1 = tmr2_ch2 */
+	/* Input pull-up/down: min. 30kOhm, typ. 40kOhm, max. 50kOhm */
+	gpioa[GPIO_CRL] = (gpioa[GPIO_CRL] & 0xffffff0f)
+			| 0x00000080;
+	/* PA1 pull-up - line up to end the start pulse */
+	gpioa[GPIO_ODR] |= 0x00000002;
+	dht_ack_wait = 1; // the next is not yet data
+#endif
+	// exti[EXTI_PR] |= 2; // clear pending event (if needed)
+	dht_dbg_ints = 0; // for debug
+	dht_dbg_any = 0;
+	dht_dbg_any2 = 0;
+#ifndef DEBUG_PA1
+	nvic[NVIC_ICPR_0] |= 0x00000080; // clear EXTI1 pending
+	nvic[NVIC_ISER_0] |= 0x00000080; // enable EXTI1 IRQ
+	exti[EXTI_PR] |= 2; // clear pending event
+	exti[EXTI_IMR] |= 2; // enable exti1 irq
+#else
+	// debugging by polling
+	nvic[NVIC_ICPR_0] |= 0x00000080; // clear EXTI1 pending
+	nvic[NVIC_ICER_0] |= 0x00000080; // disable EXTI1 IRQ
+	exti[EXTI_PR] |= 2; // clear pending event
+	exti[EXTI_IMR] |= 2; // enable exti1 irq
+
+	tmp2 = tim2[TIM_CNT];
+
+	dbg_tm_idx = 0;
+	while (gpioa[GPIO_IDR] & 2); // wait until sensor starts
+	dbg_tms_buff[dbg_tm_idx] = tim2[TIM_CNT];
+	dbg_edge_buff[dbg_tm_idx] = 0;
+	dbg_tm_idx++;
+	for (tmp=0; tmp<132; tmp++)
+	{
+		// wait until data changes
+		while (((gpioa[GPIO_IDR] & 2) >> 1) == dbg_edge_buff[dbg_tm_idx-1]);
+		//while (!(exti[EXTI_PR] & 2));
+		//while (!(nvic[NVIC_ICPR_0] & 0x00000080));
+		dbg_tms_buff[dbg_tm_idx] = tim2[TIM_CNT];
+		if (gpioa[GPIO_IDR] & 2) // if PA1 = '1' rising edge
+		{
+			dbg_edge_buff[dbg_tm_idx] = 1;
+		}
+		else
+		{
+			dbg_edge_buff[dbg_tm_idx] = 0;
+		}
+		dbg_edge_buff[dbg_tm_idx] |= (exti[EXTI_PR] & 2)<< 3;
+		dbg_tm_idx++;
+		exti[EXTI_PR] |= 2; // clear PA1 pending
+		nvic[NVIC_ICPR_0] |= 0x00000080; // clear EXTI1 pending
+	}
+
+	dbg_pa1_flag = 1;
+#endif
+}
+
+void pa1_irq(void)
+{
+	uint32_t tmp, tmp2, tmp3;
+	uint8_t i, val;
+	volatile uint32_t *tim2, *gpioa, *nvic, *exti;
+	tim2 = (uint32_t *) TIM2_BASE;
+	gpioa = (uint32_t *) PA_BASE;
+	nvic = (uint32_t *) NVIC_BASE;
+	exti = (uint32_t *) EXTI_BASE;
+
+	tmp = tim2[TIM_CNT];
+
+	/* a look at AOSONG's own data sheet showed that
+	   a state machine is actually needed. The pulse
+	   widths may overlap and cause problems */
+
+	exti[EXTI_PR] |= 2; // clear pending event
+	// dont't clear NVIC pending bits:
+	// "For example, the pending status of the exception will be
+	// cleared and the active bit of the exception will be set."
+	// "When the processor starts the interrupt handler, the active
+	// is set to '1' and cleared when the interrupt return is executed."
+
+	/* a debug as a vector of time stamps might be necessary */
+	if (gpioa[GPIO_IDR] & 2) // if PA1 = '1' rising edge
+	{
+		ts_rising = tmp; // rising edge timestamp - start of pulse
+		dht_dbg_any = 1;
+		dht_dbg_any2 = 0;
+	}
+	else // falling edge
+	{
+		if (dht_ack_wait) // Not data but 'ack' from sensor
+		{
+			dht_dbg_ints++;
+			exti[EXTI_PR] |= 2; // clear pending event
+			dht_ack_wait = 0;
+			return;
+		}
+		dht_dbg_any = 0;
+		dht_dbg_any2 = tmp;
+
+		// 0x10000 is the "length" of the 16-bit counter
+		// say, length = 100, start = 10, end = 90
+		// end - start = 80, (80 + 100) % 100 = 80
+		// if length = 100, start = 90, end = 10
+		// end - start = -80, -80 + 100 = 20, 20 % 100 = 20
+		tmp = (tmp + 0x10000 - ts_rising) % 0x10000;
+		// DHT-start = 80 us, '1' = 75 us, '0' = 38 us
+		// msb-first, 16-bit hum + 16-bit temp + 8-bit checksum
+		if (tmp > 75)
+		{
+			/* DHT's response to start pulse */
+			dht_bits_left = 40; // bits to read
+		}
+		else if (tmp > 40)
+		{
+			/* '1' */
+			i = (40 - dht_bits_left) / 8; // buffer index
+			val = (dht_buff[i] << 1) | 1; // add '1'
+			dht_buff[i] = val;
+			dht_bits_left--;
+		}
+		else
+		{
+			/* '0' */
+			i = (40 - dht_bits_left) / 8; // buffer index
+			val = (dht_buff[i] << 1); // add '0'
+			dht_buff[i] = val;
+			dht_bits_left--;
+		}
+		if (!dht_bits_left)
+		{
+			/* end DHT reading */
+			dht_ready = 1; // new DHT data read
+			// stop receiving
+			nvic[NVIC_ICER_0] |= 0x00000080; // mask EXTI1 IRQ
+			nvic[NVIC_ICPR_0] |= 0x00000080; // clear EXTI1 pending
+		}
+	}
+	dht_dbg_ints++;
+}
+
+void dht_read(void)
+{
+	// old data
+	dht_request();
+	wait_ms(2000);
+	// current data
+	dht_request();
+	wait_ms(2000);
+	// re-read until success
+	while (!dht_ready)
+	{
+		dht_request();
+		wait_ms(2000);
+	}
 }
 
 void init_pwrmon(void)
@@ -892,7 +1411,12 @@ void init_pwrmon(void)
 
 void pwr_irq(void)
 {
+	volatile uint32_t *exti, *nvic;
+	exti = (uint32_t *) EXTI_BASE;
+	nvic = (uint32_t *) NVIC_BASE;
 	power_low = 1;
+	exti[EXTI_PR] |= 0x00010000; // clear pending event
+	nvic[NVIC_ICPR_0] |= 0x00000002; // clear EXTI1 pending
 }
 
 #ifdef ADC_USED
@@ -1017,6 +1541,95 @@ void read_adc(void)
 }
 #endif
 
+#ifdef SPI_USED
+void init_spi1(void)
+{
+	volatile uint32_t *spi1, *gpioa, *rcc;
+
+	spi1 = (uint32_t *)SPI1_BASE;
+	gpioa = (uint32_t *) PA_BASE;
+	rcc = (uint32_t *) RCC_BASE;
+
+	/* Does port A have clock? */
+	if (!(rcc[RCC_APB2ENR] & 0x00000004)) /* if port A doesn't have clock */
+	{
+		rcc[RCC_APB2ENR] |= 0x00000004;
+	}
+	rcc[RCC_APB2ENR] |= 0x00001000; /* clock for SPI1 */
+
+#if 1
+	/* pins PA4 = NSS, PA5 = SCK, PA6 = MISO, PA7 = MOSI */
+	/* NSS, SCK,MOSI: Alternate function push-pull, output max 2 MHz */
+	/* MISO: Input floating */
+	gpioa[GPIO_CRL] = (gpioa[GPIO_CRL] & 0x0000ffff)
+			| 0xa4aa0000;
+#else
+	/* pins PA4 = NSS, PA5 = SCK, PA6 = MISO, PA7 = MOSI */
+	/* NSS, SCK,MOSI: Alternate function push-pull, output max 2 MHz */
+	/* MISO: Input pull-up */
+	gpioa[GPIO_CRL] = (gpioa[GPIO_CRL] & 0x0000ffff)
+			| 0xa8aa0000;
+	gpioa[GPIO_ODR] |= 0x00000040; /* PA6 pull-up */
+#endif
+	/* no BIDIR, no CRC, 8-bit, full-duplex, HW NSS,
+	   msb first, disable, master, CPOL=0, CPHA=0, + baud */
+	spi1[SPI_CR1] = 0x00000004 | (SPI1_BAUD << 3);
+	/* TODO: check the NSS configuration */
+	/* disable interrupts and DMA, set SSOE */
+	spi1[SPI_CR2] = (spi1[SPI_CR2] & 0xffffff18)
+			| 0x00000004;
+	spi1[SPI_I2SCFGR] &= 0xfffff040; // SPI-mode
+}
+
+// buff is rx/tx buffer tx data is replaced with rx data
+// and the length needs to be the bigger of the two
+// if there is more to receive than to send, the rest
+// of tx data in buffer needs to be filled with zeros
+int xfer_spi1(char *buff, int count)
+{
+	volatile uint32_t *spi1;
+	int res;
+	uint32_t status;
+	uint32_t rxi, txi;
+
+	spi1 = (uint32_t *)SPI1_BASE;
+	res = 0;
+	/* if SPI is not ON */
+	if ((spi1[SPI_CR1] & 0x00000044) != 0x00000044)
+	{
+		/* turn ON */
+		spi1[SPI_CR1] |= 0x00000044;
+	}
+	status = spi1[SPI_SR] & 0xff;
+	if (status & 0x68)
+	{
+		/* errors */
+		res = -status;
+		spi1_buff[0] = spi1[SPI_DR]; // clear error flags
+		return res;
+	}
+
+	rxi = 0;
+	txi = 0;
+	// Let's believe that tx is at least 1 step ahead of rx
+	while (rxi < count)
+	{
+		status = spi1[SPI_SR] & 0xff;
+		if (status & 1) // receiver not empty - next 8 bits received
+		{
+			spi1_buff[rxi++] = spi1[SPI_DR];
+		}
+		if (status & 2) // transmitter empty
+		{
+			spi1[SPI_DR] = spi1_buff[txi++];
+		}
+	}
+	res = rxi;
+	/* turn OFF */
+	spi1[SPI_CR1] &= ~0x00000044;
+	return res;
+}
+#endif
 
 void init(void)
 {
@@ -1033,7 +1646,9 @@ void init(void)
 	   when HSE clock fails */
 	// RCC_ClockSecuritySystemCmd(ENABLE);
 
-    inir_rtc();
+	init_led();
+
+    init_rtc();
 
     init_usart1();
 
@@ -1049,16 +1664,10 @@ void init(void)
 #ifdef DEBUG_TIM1_CLK
     init_timer1();
 #endif
-}
 
-uint32_t time_diff(uint32_t now, uint32_t earlier)
-{
-	int tmp = now - earlier;
-	if (tmp < 0)
-	{
-		tmp = MS_PER_HOUR - (earlier - now); /* modulo hour */
-	}
-	return (uint32_t) tmp;
+#ifdef DHT_SENSOR
+    init_timer2();
+#endif
 }
 
 char nibble_to_hex(char n)
@@ -1106,25 +1715,95 @@ void pr_text(char *ptr)
 	while(*ptr) putch((int)(*(ptr++)));
 }
 
+void pr_stack(void)
+{
+	uint32_t sp1, sp2, tmp1, ssz;
+
+	asm volatile
+	(
+			"MRS %[ret_reg], CONTROL\n\t"
+			: [ret_reg] "=r" (tmp1)::
+	);
+	pr_text("CONTROL: ");
+	pr_word(tmp1);
+
+	// values from linker script
+	if (tmp1 & 2) // thread mode - psp
+	{
+		ssz = (uint32_t)&__usr_stksz;
+		sp1 = (uint32_t)&__usr_stack;
+	}
+	else // handler mode - msp
+	{
+		ssz = (uint32_t)&__sys_stksz;
+		sp1 = (uint32_t)&__sys_stack;
+	}
+	// current stack pointer
+	asm volatile
+	(
+			"MOV %[ret_reg], r13\n\t"
+			: [ret_reg] "=r" (sp2)::
+	);
+	pr_text("\r\nStack: ");
+	pr_word(sp1);
+	pr_text(" - ");
+	pr_word(sp1 - ssz);
+	pr_text(" sp: ");
+	pr_word(sp2);
+	pr_text("\r\n");
+}
+
 void main(void)
 {
 	int ch;
 	char chr;
-	int flag, i;
+	int flag, i, j;
 	uint32_t last, rtc_time, rtc_old, chime, systicks, rounds;
-	volatile uint32_t *gpioc, *syst, *rtc, *tim1, *rcc, *bkp;
+	uint32_t tmpval, dht_last, tmp1, tmp2, tmp3, tmp4;
+	volatile uint32_t *gpioc, *syst, *rtc, *tim1, *tim2, *rcc, *bkp;
 	gpioc = (uint32_t *) PC_BASE;
 	syst = (uint32_t *) SYSTIC_BASE;
 	rtc = (uint32_t *) RTC_BASE;
 	tim1 = (uint32_t *) TIM1_BASE;
+	tim2 = (uint32_t *) TIM2_BASE;
 	rcc = (uint32_t *) RCC_BASE;
 	bkp = (uint32_t *) BKP_BASE;
 
 	init();
-	init_led();
+
+#if 1
+	pr_stack();
+	/* Time for printing */
+	wait_ms(50);
+#endif
+
+#ifdef DEBUG_PA1
+	dbg_pa1_flag = 0;
+#endif
+
+#ifdef DEBUG_RTC_INIT
+	/* BKP data before RTC init */
+	pr_text("Init - BKP data: ");
+	pr_word(bkp_data);
+	pr_text("\r\n");
+#endif
+
+	if ((bkp[BKP_DATA1] & 0xffff) == 0xa5a5) // crystal
+	{
+		pr_text("\r\nRTC LSE - 1 tic / s");
+	}
+	else
+	{
+		pr_text("\r\nRTC LSI - 2 tics / s");
+	}
+	pr_text("\r\n");
+	/* Time for printing */
+	wait_ms(50);
+
 	flag = 0; // led is OFF
 
 	/* debug variables */
+	dht_last = ticks;
 	last = ticks;
 	chime = ticks;
 	rounds = 0;
@@ -1165,12 +1844,6 @@ void main(void)
 	pr_text(" dec)\r\n\n");
 #endif
 
-#ifdef DEBUG_RTC_INIT
-	pr_text("BKP data: ");
-	pr_word(bkp_data);
-	pr_text("\r\n");
-#endif
-
 	last = ticks;
 	chime = ticks;
 	rtc_old = 0;
@@ -1183,9 +1856,8 @@ void main(void)
 	for(i=0; i<60; i++) // 10 minutes
 	{
 		/* for 60 seconds (about) */
-		while (time_diff(ticks, chime) < 60000);
 		chime = ticks;
-
+		while (time_diff(ticks, chime) < 60000);
 	}
 	rtc_time = (rtc[RTC_CNTH] << 16) & 0xffff0000;
 	rtc_time |= (rtc[RTC_CNTL] & 0x0000ffff);
@@ -1217,6 +1889,39 @@ void main(void)
 	pr_word(rtc_time - rtc_old);
 	pr_text("\r\n");
 	rtc_old = 0;
+#endif
+
+#if 0
+	// check timer2 frequency
+	tmp1 = syst[SYST_CVR];
+	// systick counts DOWN from TICS_PER_MS
+	while (tmp1 < (TICS_PER_MS - 20))
+	{
+	    tmp1 = syst[SYST_CVR];
+	}
+	tmp1 = syst[SYST_CVR];
+	//tmp1 = ticks;
+	tmp2 = tim2[TIM_CNT];
+	//while (time_diff(ticks, tmp1) < 20)
+	while (1)
+	{
+		tmp4 = tmp1 - syst[SYST_CVR];
+		if (tmp4 >= (TICS_PER_MS / 2)) break;
+	}
+	//tmp4 = ticks;
+	tmp4 = syst[SYST_CVR];
+	tmp3 = tim2[TIM_CNT];
+	pr_text("Systic: ");
+	pr_word(tmp1);
+	pr_text(" ");
+	pr_word(tmp4);
+	pr_text(" d: ");
+	pr_word(tmp1 - tmp4);
+	pr_text("\r\nTimer2: ");
+	pr_word(tmp2);
+	pr_text(" ");
+	pr_word(tmp3);
+	pr_text("\r\n");
 #endif
 
 	while (1)
@@ -1274,12 +1979,89 @@ void main(void)
 					break;
 				}
 #endif
-
+			case 'x':
+				{
+					reinit_rtc();
+					pr_text("\r\nRTC re-init");
+					if ((bkp[BKP_DATA1] & 0xffff) == 0xa5a5) // crystal
+					{
+						pr_text("\r\nRTC LSI->LSE");
+					}
+					else
+					{
+						pr_text("\r\n->RTC LSE->LSI");
+					}
+					pr_text("\r\n");
+					break;
+				}
+			case 'z':
+				{
+					bkp[BKP_DATA1] = 0; // force clock reset
+					break;
+				}
+#ifdef DHT_SENSOR
+			case 'd':
+				{
+					dht_request();
+					break;
+				}
+#endif
 			default:
 				{
 					break; // some compilers want this
 				}
 			} /* end switch */
+		}
+#endif
+
+#ifdef DHT_SENSOR
+		// TODO: embed the multiple reading until success into
+		// into a routine of its own
+		// DHT sensor read test about once per minute
+		if (time_diff(ticks, dht_last) >= 60000)
+		{
+			dht_read();
+			dht_last = ticks;
+		}
+#endif
+
+#ifdef DEBUG_PA1
+		if (dbg_pa1_flag)
+		{
+			// dump edges: time stamps, line values and levels
+			pr_text("PA1:\r\n");
+			pr_word(dbg_tms_buff[0]);
+			pr_text(" ");
+			pr_dec((uint32_t)dbg_edge_buff[0]);
+			pr_text("\r\n");
+			for (j=1; j<dbg_tm_idx; j++)
+			{
+				pr_word(dbg_tms_buff[j]);
+				pr_text(" ");
+				pr_dec((uint32_t)dbg_edge_buff[j]);
+				tmp1 = (uint32_t)dbg_tms_buff[j] + 0x10000 - (uint32_t)dbg_tms_buff[j-1];
+				tmp1 %= 0x10000;
+				pr_text(" -> ");
+				pr_dec(tmp1);
+				// if previous data was '1', the time stamp is the
+				// duration of high level
+				if (dbg_edge_buff[j-1])
+				{
+					pr_text(" H\r\n");
+				}
+				else
+				{
+					pr_text(" L\r\n");
+
+				}
+				// let USART send out stuff before putting
+				// more text in the tx buffer
+				wait_ms(20);
+			}
+			pr_text("\r\n");
+
+			dbg_pa1_flag = 0;
+
 		}
 #endif
 
@@ -1295,6 +2077,7 @@ void main(void)
 #ifdef USE_ADC
 				read_adc();
 #endif
+
 
 #ifdef TEMP_SENSOR
 				pr_text("TEMP: ");
@@ -1335,6 +2118,51 @@ void main(void)
 		}
 #endif
 
+#ifdef DHT_SENSOR
+		if (dht_ready) // new data from DHT
+		{
+
+			// checksum
+			tmpval= 0;
+			for (i=0; i<4; i++)
+			{
+				tmpval += (uint32_t)dht_buff[i];
+			}
+			tmpval &= 255;
+			if (tmpval != (uint32_t)dht_buff[4])
+			{
+				pr_text("\r\nDHT: checksum mismatch\r\n");
+			}
+			// RH
+			tmpval = ((uint32_t)dht_buff[0]) << 8;
+			tmpval |= ((uint32_t)dht_buff[1]);
+			pr_text("\r\nDHT: RH=");
+			pr_dec(tmpval);
+			tmpval = ((uint32_t)dht_buff[2]) << 8;
+			tmpval |= ((uint32_t)dht_buff[3]);
+			pr_text(" T=");
+			if (tmpval & 0x00008000) // negative temp
+			{
+				pr_text("-"); // print sign
+				tmpval &= 0x00007fff; // drop sign
+			}
+			pr_dec(tmpval);
+			pr_text("\r\n");
+			dht_ready = 0; // don't read until re-fetched
+			rtc_time = (rtc[RTC_CNTH] << 16) & 0xffff0000;
+			rtc_time |= (rtc[RTC_CNTL] & 0x0000ffff);
+			rtc_get_time();
+			pr_text("\r\nRTC: ");
+			pr_dec((uint32_t) rtc_hour);
+			pr_text(":");
+			pr_dec((uint32_t) rtc_min);
+			pr_text(":");
+			pr_dec((uint32_t) rtc_sec);
+			pr_text("\r\n");
+
+		}
+#endif
+
 #ifdef DEBUG_RTC_CLK
 		/* every 10 seconds (about) */
 		if (time_diff(ticks, chime) >= 10000)
@@ -1351,15 +2179,6 @@ void main(void)
 			chime = ticks;
 		}
 #endif
-		/* wait 1 second */
-		//while (time_diff(ticks, last) < 1000);
-		//last = ticks;
-
-		if (rounds > 60)
-		{
-			rounds = 0; // place for breakpoint
-		}
-		rounds++;
 	}
 }
 
