@@ -45,11 +45,13 @@ SECTIONS
     	. = ALIGN(0x8);
         *(.bss)
         *(.bss*)
+        *(COMMON)
         stacks = .;
 		. = . + 2048;	/* usr stack size */
 		__usr_stack = .;
-		. = . + 4096;	/* sys stack size */
+		. = . + 6144;	/* sys stack size */
 		__sys_stack = .;
     } >SRAM
-    
+    __usr_stksz = __usr_stack - stacks;
+    __sys_stksz = __sys_stack - __usr_stack;
 }
