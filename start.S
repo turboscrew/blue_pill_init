@@ -5,6 +5,8 @@
 .extern clkint
 .extern usart1_irq
 .extern pwr_irq
+.extern timer2_irq
+.extern pa1_irq
 .globl _start
 
 .sect .vectors
@@ -34,7 +36,7 @@
 .word gen_exc @ IRQ4  FLASH
 .word gen_exc @ IRQ5  RCC
 .word gen_exc @ IRQ6  EXTI0
-.word gen_exc @ IRQ7  EXTI1
+.word pa1_exc @ IRQ7  EXTI1
 .word gen_exc @ IRQ8  EXTI2
 .word gen_exc @ IRQ9  EXTI3
 .word gen_exc @ IRQ10 EXTI4
@@ -55,7 +57,7 @@
 .word gen_exc @ IRQ25 TIM1_UP
 .word gen_exc @ IRQ26 TIM1_TRG/COM
 .word gen_exc @ IRQ27 TIM1_CC
-.word gen_exc @ IRQ28 TIM2
+.word tmr2_exc @ IRQ28 TIM2
 .word gen_exc @ IRQ29 TIM3
 .word gen_exc @ IRQ30 TIM4
 .word gen_exc @ IRQ31 I2C1_EV
@@ -89,6 +91,18 @@ pwrint:
 usart1_exc:
 	push {lr}
 	bl usart1_irq
+	pop {pc}
+
+.thumb_func
+tmr2_exc:
+	push {lr}
+	bl timer2_irq
+	pop {pc}
+
+.thumb_func
+pa1_exc:
+	push {lr}
+	bl pa1_irq
 	pop {pc}
 
 .thumb_func
