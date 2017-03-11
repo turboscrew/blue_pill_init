@@ -124,7 +124,6 @@ timers are connected. RM0008, 7.2 Clocks */
 #define AFIO_EXTICR4 5
 /* reg 6 doesn't exist */
 #define AFIO_MAPR2 7
-#define PC_13
 #define FLASH_ACR 0
 #define PWR_CR 0
 #define PWR_CSR 1
@@ -159,12 +158,14 @@ timers are connected. RM0008, 7.2 Clocks */
 #define TIM_CNT 9
 #define TIM_PSC 10
 #define TIM_ARR 11
-#define TIM_CCR1 12
-#define TIM_CCR2 13
-#define TIM_CCR3 14
-#define TIM_CCR4 15
-#define TIM_DCR 16
-#define TIM_DMAR 17
+#define TIM_RCR 12
+#define TIM_CCR1 13
+#define TIM_CCR2 14
+#define TIM_CCR3 15
+#define TIM_CCR4 16
+#define TIM_BDTR 17
+#define TIM_DCR 18
+#define TIM_DMAR 19
 #define EXTI_IMR 0
 #define EXTI_EMR 1
 #define EXTI_RTSR 2
@@ -542,6 +543,7 @@ void init_rtc(void)
     rcc[RCC_BDCR] |= ((uint32_t) 0x00010000);
 
 	/* Enable PWR, BKP and SPI2, disable other peripherals */
+	/* BKP must be enabled, otherwise RCC_BDCR-bits don't get written */
 	rcc[RCC_APB1ENR] = (rcc[RCC_APB1ENR] & (uint32_t) 0xc5013600)
 		| ((uint32_t) 0x18004000);
 
@@ -649,6 +651,7 @@ void reinit_rtc(void)
 	//rcc[RCC_BDCR] &= ~((uint32_t) 0x00010000);
 
 	/* Enable BKP */
+	/* BKP must be enabled, otherwise RCC_BDCR-bits don't get written */
 	rcc[RCC_APB1ENR] |= 0x01000000;
 
 	/* Enable Backup domain access after bkp-reset
